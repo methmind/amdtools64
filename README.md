@@ -1,197 +1,195 @@
-# AmdTools64.sys — arbitrary physical memory access from user mode
+# AmdTools64.sys — произвольный доступ к физической памяти из юзермода
 
-Security research on `AmdTools64.sys` ("AMD Tools Driver" 1.7.16.219), an
-AMD-signed Windows kernel driver that is not part of any public AMD software
-distribution. The driver exposes a rich set of `METHOD_BUFFERED` IOCTLs that
-map, read and write **arbitrary attacker-controlled physical memory** from
-user mode, which turns the driver into a fully working BYOVD ("bring your own
-vulnerable driver") primitive.
+Секьюрити-ресёрч драйвера `AmdTools64.sys` ("AMD Tools Driver" 1.7.16.219) —
+AMD-подписанного кернел-драйвера, которого нет ни в одном публичном
+дистрибутиве AMD. Драйвер наружу торит богатый набор `METHOD_BUFFERED`
+IOCTL-ов, через которые можно из юзермода мапить, читать и писать **произвольную
+физическую память с attacker-controlled адресом**. Итог — полностью рабочий
+BYOVD-примитив ("bring your own vulnerable driver").
 
-To the best of our knowledge the sample is not currently on Microsoft's
-recommended vulnerable-driver blocklist.
+Насколько нам известно, в рекомендованном Microsoft блоклисте уязвимых
+драйверов семпла пока нет.
 
-## Affected component
+## Пострадавший компонент
 
-| Field | Value |
+| Поле | Значение |
 |---|---|
-| File | `AmdTools64.sys` |
-| Product version | 1.7.16.219 |
-| Original name | `amdtools64.sys` |
+| Файл | `AmdTools64.sys` |
+| Версия | 1.7.16.219 |
+| Оригинальное имя | `amdtools64.sys` |
 | SHA-256 | `891007BC9F3B55AE168FA60CCBB831CCDB5DCE4DA4A591D000806D5A2C6115C3` |
-| Signature | "Advanced Micro Devices Inc." (Sectigo RSA Code Signing CA, cross-certified via Microsoft Code Verification Root) |
-| Build timestamp | 2022-06-22 (PE header) |
-| PDB path | `C:\Project\AmdToolsDriver\src\AMD Special Tools Driver\x64\Release\amdtools64.pdb` |
+| Подпись | "Advanced Micro Devices Inc." (Sectigo RSA Code Signing CA, кросс-сертификат через Microsoft Code Verification Root) |
+| Таймстамп сборки | 2022-06-22 (PE-заголовок) |
+| PDB-путь | `C:\Project\AmdToolsDriver\src\AMD Special Tools Driver\x64\Release\amdtools64.pdb` |
 
-The driver is a PnP driver. Its `AddDevice` creates a device via
-`IoCreateDeviceSecure` with SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)` (SYSTEM and
-Administrators only) and registers a device interface with GUID
-`{1232175B-1C34-41FD-B101-342D47B828AC}`. Loading the driver therefore only
-requires administrator rights, after which the IOCTLs below break the
-admin-to-kernel boundary.
+Драйвер — PnP-шный. В `AddDevice` он создаёт девайс через
+`IoCreateDeviceSecure` с SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)` (доступ только у
+SYSTEM и админов) и регистрирует device-интерфейс с GUID
+`{1232175B-1C34-41FD-B101-342D47B828AC}`. То есть для загрузки драйвера хватает
+прав админа, а дальше перечисленные ниже IOCTL-ы сносят границу
+админ→кернел в щепки.
 
-## Arbitrary physical memory primitives
+## Примитивы произвольного доступа к физпамяти
 
-### `0xFFF028A4` — map arbitrary physical memory into user mode (RW)
+### `0xFFF028A4` — мапим произвольную физическую память себе в юзермод (RW)
 
-Request layout (`METHOD_BUFFERED`, input and output `>= 0x21` bytes):
+Структура запроса (`METHOD_BUFFERED`, вход и выход `>= 0x21` байт):
 
 ```c
 struct MmapRequest {
-    UINT64 PhysicalAddress; // +0x00 in:  physical base address (unvalidated)
-    UINT32 Length;          // +0x08 in:  size in bytes (unvalidated)
-    UINT32 Status;          // +0x0C out: driver status
-    PVOID  PoolCtx;         // +0x10 out: driver-side allocation (pass to 0xFFF028A8 to unmap)
-    PVOID  UserVa;          // +0x18 out: user-mode mapping of the physical memory
+    UINT64 PhysicalAddress; // +0x00 in:  физический базовый адрес (никем не проверяется)
+    UINT32 Length;          // +0x08 in:  размер в байтах (тоже без проверок)
+    UINT32 Status;          // +0x0C out: статус драйвера
+    PVOID  PoolCtx;         // +0x10 out: аллокация на стороне драйвера (отдать в 0xFFF028A8 для анмапа)
+    PVOID  UserVa;          // +0x18 out: юзермод-маппинг этой физической памяти
     UINT8  CacheType;       // +0x20 in:  0 = NonCached, 1 = Cached, 2 = WriteCombined
 };
 ```
 
-The handler runs `MmMapIoSpace` → `IoAllocateMdl` →
+Хендлер делает `MmMapIoSpace` → `IoAllocateMdl` →
 `MmBuildMdlForNonPagedPool` → `MmMapLockedPagesSpecifyCache(Mdl, UserMode, ...)`
-and returns the resulting user-mode address. The mapping is readable **and
-writable**, so a single call yields full kernel read/write. `0xFFF028A8` frees
-a previously returned mapping (`PoolCtx`).
+и возвращает получившийся юзермод-адрес. Маппинг читается **и пишется**, так
+что один вызов = полный read/write по ядру. `0xFFF028A8` освобождает ранее
+выданный маппинг (`PoolCtx`).
 
-### `0xFFF0281C` / `0xFFF02820` — one-shot block read / block write
+### `0xFFF0281C` / `0xFFF02820` — one-shot блочное чтение / блочная запись
 
-Both share the same 0x10C-byte request (input and output `>= 0x10C`):
+У обоих одинаковый запрос на 0x10C байт (вход и выход `>= 0x10C`):
 
 ```c
 struct PhysBlockRequest {
-    UINT64 PhysicalAddress; // +0x00 in: 64-bit physical address (unvalidated)
-    UINT16 Width;           // +0x08 in: byte count, 1..0x100
-    UINT16 Status;          // +0x0A out: 0 = ok, 5 = MmMapIoSpace failed, 6 = bad width
-    UINT8  Data[0x100];     // +0x0C in (write) / out (read)
+    UINT64 PhysicalAddress; // +0x00 in: 64-битный физический адрес (без валидации)
+    UINT16 Width;           // +0x08 in: сколько байт, 1..0x100
+    UINT16 Status;          // +0x0A out: 0 = ок, 5 = MmMapIoSpace обломался, 6 = кривой width
+    UINT8  Data[0x100];     // +0x0C in (запись) / out (чтение)
 };
 ```
 
-* `0xFFF0281C` (handler `0x1400026e8`): `MmMapIoSpace` → copy `Width` bytes
-  from the mapped region into `Data` → `MmUnmapIoSpace` — **arbitrary read**.
-* `0xFFF02820` (handler `0x140003050`): `MmMapIoSpace` → copy `Width` bytes
-  from `Data` into the mapped region → `MmUnmapIoSpace` — **arbitrary write**.
+* `0xFFF0281C` (хендлер `0x1400026e8`): `MmMapIoSpace` → скопировать `Width`
+  байт из замапленного в `Data` → `MmUnmapIoSpace` — **произвольное чтение**.
+* `0xFFF02820` (хендлер `0x140003050`): `MmMapIoSpace` → скопировать `Width`
+  байт из `Data` в замапленное → `MmUnmapIoSpace` — **произвольная запись**.
 
-`MmMapIoSpace` is called with `MmCached`; note that `MmMapIoSpace(0, ...)`
-fails, so physical address 0 is the only unusable address.
+`MmMapIoSpace` вызывается с `MmCached`; учтите, что `MmMapIoSpace(0, ...)`
+фейлится, так что физический адрес 0 — единственный «неюзабельный».
 
-### Other physical-memory read primitives
+### Прочие примитивы чтения физпамяти
 
-| IOCTL | Size | Behaviour |
+| IOCTL | Размер | Что делает |
 |---|---|---|
-| `0xFFF02888` | 0x20 | `MmMapIoSpace(Phys, Len)` → copy into pool → map pool to user; returns `PoolCtx` + `UserVa`. `Len` is unvalidated. `0xFFF0288C` frees. |
-| `0xFFF02824` | 0x2122 | Pattern search over physical memory: maps `[Base, Base+WindowSize)`, probes every `Stride` bytes with `RtlCompareMemory` against `Pattern` (`ChunkSize <= 0x100`), on match copies up to `ReadLength (<= 0x2000)` bytes back and returns the match address. |
+| `0xFFF02888` | 0x20 | `MmMapIoSpace(Phys, Len)` → копия в пул → мап пула в юзермод; возвращает `PoolCtx` + `UserVa`. `Len` вообще без проверок. `0xFFF0288C` освобождает. |
+| `0xFFF02824` | 0x2122 | Поиск паттерна по физпамяти: мапит `[Base, Base+WindowSize)`, тыкается с шагом `Stride` через `RtlCompareMemory` против `Pattern` (`ChunkSize <= 0x100`), при мэтче копирует до `ReadLength (<= 0x2000)` байт назад и возвращает адрес совпадения. |
 
-### Other arbitrary/near-arbitrary write primitives
+### Прочие произвольные / почти произвольные примитивы записи
 
-| IOCTL | Size | Behaviour |
+| IOCTL | Размер | Что делает |
 |---|---|---|
-| `0xFFF02894` | 0xC | SMN (AMD System Management Network) register **write**: base address taken from MSR `0xC0010058` masked with `0xFFFFFFF00000`, plus a fully user-controlled offset; byte/word/dword (`WRITE_REGISTER_*`) from the request. |
-| `0xFFF02890` | 0xC | SMN register read (same addressing). |
-| `0xFFF02884` | 8 | APIC register **write**: maps the APIC base from MSR `0x1B` (enabling the APIC via `WRMSR` first if necessary), offset `WORD[req] < 0x20`, value `DWORD[req+4]`, returns the old value. |
-| `0xFFF02880` | 8 | APIC register read (same addressing). |
-| `0xFFF02830` | 0xA | PCI configuration space **write** via `HalSetBusDataByOffset`: `{Bus, Func, Dev, Width(1/2/4), Offset, Status, Value}`. Combined with the BAR-mapping IOCTLs below this yields an indirect arbitrary physical mapping primitive (rewrite a BAR, then map it). |
-| `0xFFF0282C` | 0xA | PCI configuration space read via `HalGetBusDataByOffset`. |
-| `0xFFF02834` / `0xFFF0283C` | 0x16 | Read the BAR of an attacker-chosen PCI device (`Bus/Dev/Func/Offset`) and map it into user mode; `0xFFF02840` / `0xFFF02838` are the matching unmap IOCTLs. |
+| `0xFFF02894` | 0xC | **Запись** в регистр SMN (AMD System Management Network): база из MSR `0xC0010058`, замаскированная `0xFFFFFFF00000`, плюс полностью юзер-контролируемый офсет; byte/word/dword (`WRITE_REGISTER_*`) из запроса. |
+| `0xFFF02890` | 0xC | Чтение SMN-регистра (та же адресация). |
+| `0xFFF02884` | 8 | **Запись** в регистр APIC: мапит базу APIC из MSR `0x1B` (при необходимости сначала включая APIC через `WRMSR`), офсет `WORD[req] < 0x20`, значение `DWORD[req+4]`, возвращает старое значение. |
+| `0xFFF02880` | 8 | Чтение регистра APIC (та же адресация). |
+| `0xFFF02830` | 0xA | **Запись** в PCI configuration space через `HalSetBusDataByOffset`: `{Bus, Func, Dev, Width(1/2/4), Offset, Status, Value}`. В связке с BAR-маппингом ниже это даёт непрямой произвольный физический маппинг (переписали BAR → замапили его). |
+| `0xFFF0282C` | 0xA | Чтение PCI configuration space через `HalGetBusDataByOffset`. |
+| `0xFFF02834` / `0xFFF0283C` | 0x16 | Читают BAR произвольного PCI-девайса (`Bus/Dev/Func/Offset`) и мапят его в юзермод; `0xFFF02840` / `0xFFF02838` — парные анмапы. |
 
-### Memory allocation primitives
+### Примитивы аллокации памяти
 
-| IOCTL | Size | Behaviour |
+| IOCTL | Размер | Что делает |
 |---|---|---|
-| `0xFFF028AC` | 0x38 | `MmAllocateContiguousMemorySpecifyCache` + MDL + user-mode mapping of the allocation; `0xFFF028B0` frees. |
-| `0xFFF02868` / `0xFFF0289C` | 0x2E | `MmAllocatePagesForMdl` (attacker-controlled physical range) + user-mode mapping; `0xFFF0286C` / `0xFFF028A0` free. |
+| `0xFFF028AC` | 0x38 | `MmAllocateContiguousMemorySpecifyCache` + MDL + юзермод-маппинг аллокации; `0xFFF028B0` освобождает. |
+| `0xFFF02868` / `0xFFF0289C` | 0x2E | `MmAllocatePagesForMdl` (диапазон физики задаёт атакующий) + юзермод-маппинг; `0xFFF0286C` / `0xFFF028A0` освобождают. |
 
-### Full IOCTL dispatch table
+### Полная таблица диспетчеризации IOCTL
 
-Single dispatcher at `0x140005968`; `0xFFF028C0` selects a batch/command-list
-processor instead. Handler addresses are from the 1.7.16.219 build.
+Один диспетчер на `0x140005968`; `0xFFF028C0` переключает на
+батч/command-list процессор. Адреса хендлеров — из билда 1.7.16.219.
 
-| IOCTL | Handler | In/Out min | Function |
+| IOCTL | Хендлер | Мин. in/out | Функция |
 |---|---|---|---|
-| `0xFFF02800` | inline | 4 | return version `0x010710DA` |
-| `0xFFF02804` | `0x1400027BC` | 0x14 | SMU/MP1 command |
-| `0xFFF02808` | `0x140003124` | 0x14 | SMU/MP1 command |
-| `0xFFF0280C` | `0x140002BD0` | — | SMU/MP1 command |
-| `0xFFF02810` | `0x140002BD0` | — | SMU/MP1 command |
-| `0xFFF02814` | `0x140002990` | 8 | SMU/MP1 command |
-| `0xFFF02818` | `0x1400032F0` | 8 | SMU/MP1 command |
-| `0xFFF0281C` | `0x1400026E8` | 0x10C | **physical read (<= 0x100 B)** |
-| `0xFFF02820` | `0x140003050` | 0x10C | **physical write (<= 0x100 B)** |
-| `0xFFF02824` | `0x140002A38` | 0x2122 | **physical pattern search + bulk read** |
-| `0xFFF02828` | `0x140001A44` | 8 | SMU/MP1 command |
-| `0xFFF0282C` | `0x140002818` | 0xA | **PCI config read** |
-| `0xFFF02830` | `0x140003188` | 0xA | **PCI config write** |
-| `0xFFF02834` | `0x1400022FC` | 0x16 | **map PCI BAR to user mode** |
-| `0xFFF02838` | `0x140002D70` | 0x16 | unmap |
-| `0xFFF0283C` | `0x140001CAC` | 0x16 | map PCI BAR (via pool copy) |
-| `0xFFF02840` | `0x140002C34` | 0x16 | unmap |
-| `0xFFF02844` | `0x140002504` | 6 | SMU/MP1 command |
-| `0xFFF02848` | `0x1400029C0` | 3 | SMU/MP1 command |
-| `0xFFF0284C` | `0x140003320` | 3 | SMU/MP1 command |
-| `0xFFF02850` | `0x14000269C` | 2 | SMU/MP1 command |
-| `0xFFF02854` | `0x140003000` | 2 | SMU/MP1 command |
-| `0xFFF02858` | `0x140001C94` | 1 | SMU/MP1 command |
-| `0xFFF0285C` | `0x140006504` | 8 | SMU/MP1 command |
-| `0xFFF02860` | `0x14000261C` | 0xC | SMU/MP1 command |
-| `0xFFF02864` | `0x140002EF0` | 0xC | SMU/MP1 command |
-| `0xFFF02868` | `0x14000187C` | 0x2E | **MmAllocatePagesForMdl + user map** |
-| `0xFFF0286C` | `0x140001BC0` | 0x2E | free |
-| `0xFFF02870` | `0x140002668` | 0xC | SMU/MP1 command |
-| `0xFFF02874` | `0x140002F78` | 0xC | SMU/MP1 command |
-| `0xFFF0287C` | `0x140002DF8` | — | SMU/MP1 command |
-| `0xFFF02880` | `0x140002534` | 8 | APIC register read |
-| `0xFFF02884` | `0x140002E00` | 8 | APIC register write |
-| `0xFFF02888` | `0x140001EF0` | 0x20 | **snapshot physical range to user map** |
-| `0xFFF0288C` | `0x140002CA8` | 0x20 | free snapshot |
-| `0xFFF02890` | `0x1400028B0` | 0xC | **SMN register read** |
-| `0xFFF02894` | `0x140003210` | 0xC | **SMN register write** |
-| `0xFFF02898` | `0x140001C44` | 0xC | SMU/MP1 command |
-| `0xFFF0289C` | `0x140001960` | 0x2E | **MmAllocatePagesForMdl + user map** |
-| `0xFFF028A0` | `0x140001BC0` | 0x2E | free |
-| `0xFFF028A4` | `0x1400020E4` | 0x21 | **map arbitrary physical memory (RW)** |
-| `0xFFF028A8` | `0x140002D1C` | 0x21 | unmap |
-| `0xFFF028AC` | `0x140001668` | 0x38 | **contiguous memory alloc + user map** |
-| `0xFFF028B0` | `0x140001B30` | 0x38 | free |
-| `0xFFF028B8` | `0x140001C28` | 8 | SMU/MP1 command |
-| `0xFFF028BC` | `0x140002BB0` | 0x10 | SMU/MP1 command |
-| `0xFFF028C0` | `0x1400057E0` | — | batch command-list processor |
-| `0xFFF028C4` | `0x140002BD0` | 2/0x78 | SMU/MP1 command |
-| `0xFFF02900` | `0x140001368` | 0x118/0x14 | forwards request to another device |
-| `0xFFF02940` | `0x140002A14` | 0x18 | forwards request to another device |
+| `0xFFF02800` | инлайн | 4 | вернуть версию `0x010710DA` |
+| `0xFFF02804` | `0x1400027BC` | 0x14 | команда SMU/MP1 |
+| `0xFFF02808` | `0x140003124` | 0x14 | команда SMU/MP1 |
+| `0xFFF0280C` | `0x140002BD0` | — | команда SMU/MP1 |
+| `0xFFF02810` | `0x140002BD0` | — | команда SMU/MP1 |
+| `0xFFF02814` | `0x140002990` | 8 | команда SMU/MP1 |
+| `0xFFF02818` | `0x1400032F0` | 8 | команда SMU/MP1 |
+| `0xFFF0281C` | `0x1400026E8` | 0x10C | **чтение физпамяти (<= 0x100 Б)** |
+| `0xFFF02820` | `0x140003050` | 0x10C | **запись в физпамять (<= 0x100 Б)** |
+| `0xFFF02824` | `0x140002A38` | 0x2122 | **поиск паттерна по физике + блочное чтение** |
+| `0xFFF02828` | `0x140001A44` | 8 | команда SMU/MP1 |
+| `0xFFF0282C` | `0x140002818` | 0xA | **чтение PCI config** |
+| `0xFFF02830` | `0x140003188` | 0xA | **запись PCI config** |
+| `0xFFF02834` | `0x1400022FC` | 0x16 | **мап PCI BAR в юзермод** |
+| `0xFFF02838` | `0x140002D70` | 0x16 | анмап |
+| `0xFFF0283C` | `0x140001CAC` | 0x16 | мап PCI BAR (через копию в пул) |
+| `0xFFF02840` | `0x140002C34` | 0x16 | анмап |
+| `0xFFF02844` | `0x140002504` | 6 | команда SMU/MP1 |
+| `0xFFF02848` | `0x1400029C0` | 3 | команда SMU/MP1 |
+| `0xFFF0284C` | `0x140003320` | 3 | команда SMU/MP1 |
+| `0xFFF02850` | `0x14000269C` | 2 | команда SMU/MP1 |
+| `0xFFF02854` | `0x140003000` | 2 | команда SMU/MP1 |
+| `0xFFF02858` | `0x140001C94` | 1 | команда SMU/MP1 |
+| `0xFFF0285C` | `0x140006504` | 8 | команда SMU/MP1 |
+| `0xFFF02860` | `0x14000261C` | 0xC | команда SMU/MP1 |
+| `0xFFF02864` | `0x140002EF0` | 0xC | команда SMU/MP1 |
+| `0xFFF02868` | `0x14000187C` | 0x2E | **MmAllocatePagesForMdl + мап в юзермод** |
+| `0xFFF0286C` | `0x140001BC0` | 0x2E | освобождение |
+| `0xFFF02870` | `0x140002668` | 0xC | команда SMU/MP1 |
+| `0xFFF02874` | `0x140002F78` | 0xC | команда SMU/MP1 |
+| `0xFFF0287C` | `0x140002DF8` | — | команда SMU/MP1 |
+| `0xFFF02880` | `0x140002534` | 8 | чтение регистра APIC |
+| `0xFFF02884` | `0x140002E00` | 8 | запись регистра APIC |
+| `0xFFF02888` | `0x140001EF0` | 0x20 | **снапшот диапазона физики в юзермод** |
+| `0xFFF0288C` | `0x140002CA8` | 0x20 | освобождение снапшота |
+| `0xFFF02890` | `0x1400028B0` | 0xC | **чтение SMN-регистра** |
+| `0xFFF02894` | `0x140003210` | 0xC | **запись SMN-регистра** |
+| `0xFFF02898` | `0x140001C44` | 0xC | команда SMU/MP1 |
+| `0xFFF0289C` | `0x140001960` | 0x2E | **MmAllocatePagesForMdl + мап в юзермод** |
+| `0xFFF028A0` | `0x140001BC0` | 0x2E | освобождение |
+| `0xFFF028A4` | `0x1400020E4` | 0x21 | **мап произвольной физической памяти (RW)** |
+| `0xFFF028A8` | `0x140002D1C` | 0x21 | анмап |
+| `0xFFF028AC` | `0x140001668` | 0x38 | **аллокация contiguous memory + мап в юзермод** |
+| `0xFFF028B0` | `0x140001B30` | 0x38 | освобождение |
+| `0xFFF028B8` | `0x140001C28` | 8 | команда SMU/MP1 |
+| `0xFFF028BC` | `0x140002BB0` | 0x10 | команда SMU/MP1 |
+| `0xFFF028C0` | `0x1400057E0` | — | батч/command-list процессор |
+| `0xFFF028C4` | `0x140002BD0` | 2/0x78 | команда SMU/MP1 |
+| `0xFFF02900` | `0x140001368` | 0x118/0x14 | форвард запроса в другой девайс |
+| `0xFFF02940` | `0x140002A14` | 0x18 | форвард запроса в другой девайс |
 
-Entries marked "SMU/MP1 command" pass small fixed-size payloads to the AMD
-SMU mailbox and were not audited in depth; several of them also end in
-`MmMapIoSpace`-based access.
+Пункты с пометкой «команда SMU/MP1» прокидывают мелкие фиксированные
+пейлоады в mailbox AMD SMU — глубоко мы их не аудировали; некоторые из них
+тоже заканчиваются доступом через `MmMapIoSpace`.
 
-## Proof-of-concept code
+## Proof-of-concept код
 
-### `poc_amdtools64.cpp` — physical memory read via `0xFFF028A4`
+### `poc_amdtools64.cpp` — чтение физпамяти через `0xFFF028A4`
 
-Installs the driver as a kernel service, creates a root-enumerated PnP
-devnode, opens the device interface, maps physical `0x53000000`
-(`Length = 0x200000`, `MmNonCached`) into user mode and dumps the first
-64 bytes.
+Ставит драйвер кернел-сервисом, создаёт root-enumerated PnP-девноду, открывает
+device-интерфейс, мапит физику `0x53000000` (`Length = 0x200000`,
+`MmNonCached`) в юзермод и дампит первые 64 байта.
 
 ```
 cl /EHsc /W4 poc_amdtools64.cpp cfgmgr32.lib     (MSVC x64)
 poc_amdtools64.exe C:\absolute\path\to\AmdTools64.sys
 ```
 
-### `poc_amdtools64_write.cpp` — physical memory write via `0xFFF02820`
+### `poc_amdtools64_write.cpp` — запись в физпамять через `0xFFF02820`
 
-End-to-end, crash-safe demonstration of the **arbitrary write**:
+Сквозная и при этом crash-safe демонстрация **произвольной записи**:
 
-1. installs the driver and binds it to the devnode (see "Loading the driver"
-   below);
-2. allocates one **AWE page** (`AllocateUserPhysicalPages`, requires
-   `SeLockMemoryPrivilege`) — a physical frame *owned by the process*, so the
-   test can never corrupt unrelated kernel/device memory;
-3. plants a random 32-byte marker in the frame through its user-mode mapping
-   and verifies the driver's read primitive (`0xFFF0281C`) sees it at
+1. ставит драйвер и биндит его к девноде (см. «Загрузка драйвера» ниже);
+2. аллоцирует **AWE-страницу** (`AllocateUserPhysicalPages`, нужен
+   `SeLockMemoryPrivilege`) — физический фрейм, *принадлежащий процессу*, так
+   что тест гарантированно не покорраптит чужой кернел/девайс-памяти;
+3. кидает в фрейм случайный 32-байтный маркер через свой юзермод-маппинг и
+   проверяет, что read-примитив драйвера (`0xFFF0281C`) видит его по адресу
    `PFN << 12`;
-4. writes the payload `"AmdTools64 0xFFF02820 phys write"` to
-   `phys + 0x800` with `0xFFF02820` and shows the bytes appear in the
-   process' own virtual address;
-5. additionally exercises the `Width == 4` (DWORD) path of the handler;
-6. stops and deletes the service.
+4. пишет пейлоад `"AmdTools64 0xFFF02820 phys write"` по `phys + 0x800` через
+   `0xFFF02820` и показывает, что байты появились в собственном виртуальном
+   адресе процесса;
+5. бонусом дергает `Width == 4` (DWORD) путь хендлера;
+6. останавливает и удаляет сервис.
 
 ```
 x86_64-w64-mingw32-g++ -O2 -static -o poc_amdtools64_write.exe \
@@ -199,7 +197,7 @@ x86_64-w64-mingw32-g++ -O2 -static -o poc_amdtools64_write.exe \
 poc_amdtools64_write.exe C:\absolute\path\to\AmdTools64.sys
 ```
 
-Verified working output (Windows 10 21H2 x64, KVM/QEMU VM):
+Проверенный вывод (Windows 10 21H2 x64, KVM/QEMU VM):
 
 ```
 [+] AWE frame mapped: PFN 0x1B1BAC -> physical 0x1B1BAC000
@@ -208,57 +206,56 @@ Verified working output (Windows 10 21H2 x64, KVM/QEMU VM):
 [+] driver accepted the write (status = 0)
 [+] PROOF: bytes appeared in OUR user-mode page @0000000001fb0800:
     AmdTools64 0xFFF02820 phys write
-[+] DWORD write path verified (0x44434241 @phys 0x1B1BAC810)
+[+] DWORD write path verified (0x443342341 @phys 0x1B1BAC810)
 ```
 
-## Loading the driver on Windows 10 21H2
+## Загрузка драйвера на Windows 10 21H2
 
-The driver is a pure PnP driver (the device is only created in `AddDevice`),
-and modern Windows refuses to bind a bare root devnode to a service without a
-driver package ("No compatible drivers found"; `UpdateDriverForPlugAndPlayDevices`
-fails with `0xE000022F` because the package has no catalog). The PoC uses an
-**INF-squat** technique that works without any custom signed package:
+Драйвер — чисто PnP-шный (девайс создаётся только в `AddDevice`), а современная
+Windows отказывается биндить голую root-девноду к сервису без драйвер-пакета
+(«No compatible drivers found»; `UpdateDriverForPlugAndPlayDevices` фейлится с
+`0xE000022F`, потому что у пакета нет каталога). PoC использует технику
+**INF-сквоттинга**, которая работает без единого своего подписанного пакета:
 
-1. create the service (`CreateServiceW`);
-2. create a root devnode `ROOT\AMDTOOLS64\0000` (`CM_Create_DevNodeW`);
-3. give it a hardware ID that matches an *already staged* driver package, e.g.
-   `ACPI\QEMU0001` from virtio `pvpanic.inf` (`CM_Add_IDW`) and run
-   `CM_Setup_DevNode` — PnP installs that package and creates the class node;
-4. rewrite the `Service` value (in both `Enum\ROOT\AMDTOOLS64\0000` and
-   `Control\Class\{...}\00NN`) to `AmdTools64`;
-5. disable/enable the device — PnP now loads `AmdTools64.sys` and `AddDevice`
-   registers the device interface.
+1. создаём сервис (`CreateServiceW`);
+2. создаём root-девноду `ROOT\AMDTOOLS64\0000` (`CM_Create_DevNodeW`);
+3. вешаем на него hardware ID, совпадающий с *уже staged* драйвер-пакетом —
+   например `ACPI\QEMU0001` из virtio `pvpanic.inf` (`CM_Add_IDW`) — и дергаем
+   `CM_Setup_DevNode`: PnP ставит тот пакет и создаёт class node;
+4. переписываем значение `Service` (и в `Enum\ROOT\AMDTOOLS64\0000`, и в
+   `Control\Class\{...}\00NN`) на `AmdTools64`;
+5. disable/enable девайса — PnP грузит уже `AmdTools64.sys`, и `AddDevice`
+   регистрирует device-интерфейс.
 
-Administrative rights are required, matching the standard BYOVD threat model.
-`SeLockMemoryPrivilege` ("Lock pages in memory") additionally needs to be
-granted to the account for the AWE-based verification in
-`poc_amdtools64_write.cpp`.
+Нужны админские права — стандартная BYOVD-модель угрозы. Для
+AWE-верификации в `poc_amdtools64_write.cpp` аккаунту дополнительно нужно
+право `SeLockMemoryPrivilege` («Блокировка страниц в памяти»).
 
-## Driver quirks worth knowing
+## Подводные камни драйвера
 
-* `MmMapIoSpace(0, ...)` fails, and ranges covering non-RAM holes (VGA range,
-  MMIO, beyond top of RAM) fail with `STATUS_NO_MEMORY` (`0xC0000017`) —
-  relevant when scripting the read/search IOCTLs.
-* `MmMapIoSpace` with `MmCached` fails for ranges somewhere between 64 KiB and
-  1 MiB (`0xFFF02824` searches were verified working with 64 KiB windows and
-  failing with 1 MiB windows); the `MmNonCached` path used by `0xFFF02888`
-  handles at least 64 MiB.
-* The `0xFFF028A4` mapping returned to user mode is writable — the "read"
-  primitive is implicitly a read/write primitive as well.
+* `MmMapIoSpace(0, ...)` фейлится, а диапазоны, накрывающие не-RAM дыры
+  (VGA-диапазон, MMIO, за верхом RAM), отваливаются с `STATUS_NO_MEMORY`
+  (`0xC0000017`) — актуально, когда скриптуешь read/search IOCTL-ы.
+* `MmMapIoSpace` с `MmCached` фейлится на диапазонах где-то между 64 КиБ и
+  1 МиБ (поиск через `0xFFF02824` проверенно работает с окнами 64 КиБ и
+  падает с окнами 1 МиБ); путь `MmNonCached` у `0xFFF02888` тянет как минимум
+  64 МиБ.
+* Маппинг, который `0xFFF028A4` отдаёт в юзермод, — writable, так что примитив
+  «чтения» по факту является read/write-примитивом.
 
-## Repository layout
+## Что лежит в репе
 
-| File | Description |
+| Файл | Описание |
 |---|---|
-| `AmdTools64.sys` | vulnerable driver sample (AMD-signed) |
-| `poc_amdtools64.cpp` | read PoC via `0xFFF028A4` (map physical → user) |
-| `poc_amdtools64_write.cpp` | write PoC via `0xFFF02820` (AWE-verified, tested on VM) |
-| `amdtools64_loldrivers.yaml` | LOLDrivers submission entry |
-| `loldrivers_issue.md` | LOLDrivers issue draft |
-| `amd_psirt_report.txt` | AMD PSIRT coordinated disclosure report draft |
+| `AmdTools64.sys` | семпл уязвимого драйвера (AMD-подписанный) |
+| `poc_amdtools64.cpp` | read-PoC через `0xFFF028A4` (мап физики → юзермод) |
+| `poc_amdtools64_write.cpp` | write-PoC через `0xFFF02820` (AWE-верификация, обкатано на VM) |
+| `amdtools64_loldrivers.yaml` | сабмит в LOLDrivers |
+| `loldrivers_issue.md` | черновик ишью для LOLDrivers |
+| `amd_psirt_report.txt` | черновик отчета для AMD PSIRT (coordinated disclosure) |
 
-## Disclosure
+## Дискложаж
 
-Reported to AMD PSIRT under coordinated disclosure. The finding has not been
-publicly disclosed at the time of writing. Do not use this code against
-systems you do not own or have explicit permission to test.
+Зарепорчено в AMD PSIRT в рамках coordinated disclosure. На момент написания
+инфа не паблилась. Не используйте этот код против систем, которыми не владеете
+или на которых нет явного разрешения на тестирование.
